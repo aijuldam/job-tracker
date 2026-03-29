@@ -163,7 +163,8 @@ export default function App() {
         hydrateFromJobs(data.map(r => ({ id: r.id as string, status: r.status as string })))
         setLastUpdated(new Date())
       } else {
-        setJobs(MOCK_JOBS[tab])
+        // Supabase is configured but no jobs yet — show empty state, not fake data
+        setJobs([])
       }
       setLoading(false)
     },

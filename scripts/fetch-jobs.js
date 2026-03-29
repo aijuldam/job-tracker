@@ -65,6 +65,10 @@ const FINANCE_KEYWORDS = [
   'financial controller',
   'fp&a',
   'financial planning',
+  'head of finance',
+  'finance director',
+  'senior finance',
+  'finance business partner',
 ]
 
 // ── Adzuna API ────────────────────────────────────────────────────────────────
@@ -239,10 +243,13 @@ async function scrapeAllCareerPages() {
 
   // Greenhouse API (JSON, reliable)
   results.push(...(await fetchGreenhouse('templafy', 'Templafy', 'pmm', PMM_KEYWORDS)))
+  results.push(...(await fetchGreenhouse('templafy', 'Templafy', 'finance', FINANCE_KEYWORDS)))
   results.push(...(await fetchGreenhouse('getyourguide', 'GetYourGuide', 'pmm', PMM_KEYWORDS)))
-  results.push(
-    ...(await fetchGreenhouse('getyourguide', 'GetYourGuide', 'finance', FINANCE_KEYWORDS)),
-  )
+  results.push(...(await fetchGreenhouse('getyourguide', 'GetYourGuide', 'finance', FINANCE_KEYWORDS)))
+  results.push(...(await fetchGreenhouse('mollie', 'Mollie', 'pmm', PMM_KEYWORDS)))
+  results.push(...(await fetchGreenhouse('mollie', 'Mollie', 'finance', FINANCE_KEYWORDS)))
+  results.push(...(await fetchGreenhouse('adyen', 'Adyen', 'pmm', PMM_KEYWORDS)))
+  results.push(...(await fetchGreenhouse('adyen', 'Adyen', 'finance', FINANCE_KEYWORDS)))
 
   // HTML scraping for non-Greenhouse sites (some are SPAs; links still appear in SSR HTML)
   const targets = [
@@ -377,7 +384,7 @@ async function main() {
   // 1. Adzuna + JSearch in parallel
   const [pmmAdzuna, financeAdzuna, pmmJSearch, financeJSearch] = await Promise.all([
     fetchAdzuna('product marketing director OR head of product marketing', 'pmm'),
-    fetchAdzuna('senior controller OR finance manager OR controlling manager', 'finance'),
+    fetchAdzuna('finance manager OR financial controller OR head of finance OR FP&A', 'finance'),
     fetchJSearch('head of product marketing OR VP product marketing OR director product marketing', 'pmm'),
     fetchJSearch('senior financial controller OR finance manager OR FP&A manager', 'finance'),
   ])
