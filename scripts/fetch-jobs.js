@@ -21,8 +21,14 @@ import { load as cheerioLoad } from 'cheerio'
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
-const { SUPABASE_URL, SUPABASE_ANON_KEY, ADZUNA_APP_ID, ADZUNA_API_KEY, ANTHROPIC_API_KEY } =
-  process.env
+const {
+  SUPABASE_URL,
+  SUPABASE_ANON_KEY,
+  ADZUNA_APP_ID,
+  ADZUNA_API_KEY,
+  ANTHROPIC_API_KEY,
+  RAPIDAPI_KEY,
+} = process.env
 
 if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
   console.error('Missing SUPABASE_URL or SUPABASE_ANON_KEY')
@@ -96,6 +102,48 @@ async function fetchAdzuna(query, tab) {
     }))
   } catch (err) {
     console.error(`Adzuna [${tab}] failed: ${err.message}`)
+    return []
+  }
+}
+
+// ── JSearch API (RapidAPI) ────────────────────────────────────────────────────
+// Covers LinkedIn + Indeed + Glassdoor results in one call
+
+async function fetchJSearch(query, tab) {
+  if (!RAPIDAPI_KEY) {
+    console.warn('RAPIDAPI_KEY not set — skipping JSearch')
+    return []
+  }
+  try {
+    const { data } = await axios.get('https://jsearch.p.rapidapi.com/search', {
+      params: {
+        query: `${query} Amsterdam Netherlands`,
+        page: '1',
+        num_pages: '3',
+        date_posted: 'month',
+      },
+      headers: {
+        'X-RapidAPI-Key': RAPIDAPI_KEY,
+        'X-RapidAPI-Host': 'jsearch.p.rapidapi.com',
+      },
+      timeout: 30_000,
+    })
+    const results = data.data ?? []
+    console.log(`JSearch [${tab}]: ${results.length} results`)
+    return results.map(job => ({
+      tab,
+      title: job.job_title,
+      company: job.employer_name ?? 'Unknown',
+      location: job.job_city ? `${job.job_city}, ${job.job_country}` : 'Amsterdam',
+      url: job.job_apply_link ?? job.job_google_link,
+      postedDate: job.job_posted_at_datetime_utc?.split('T')[0] ?? null,
+      salaryMin: job.job_min_salary ? Math.round(job.job_min_salary) : null,
+      salaryMax: job.job_max_salary ? Math.round(job.job_max_salary) : null,
+      description: job.job_description?.slice(0, 600) ?? '',
+      source: 'adzuna', // reuse existing source enum value for aggregator jobs
+    }))
+  } catch (err) {
+    console.error(`JSearch [${tab}] failed: ${err.message}`)
     return []
   }
 }
@@ -326,17 +374,19 @@ function sleep(ms) {
 async function main() {
   console.log('=== fetch-jobs start', new Date().toISOString(), '===')
 
-  // 1. Adzuna
-  const [pmmAdzuna, financeAdzuna] = await Promise.all([
+  // 1. Adzuna + JSearch in parallel
+  const [pmmAdzuna, financeAdzuna, pmmJSearch, financeJSearch] = await Promise.all([
     fetchAdzuna('product marketing director OR head of product marketing', 'pmm'),
     fetchAdzuna('senior controller OR finance manager OR controlling manager', 'finance'),
+    fetchJSearch('head of product marketing OR VP product marketing OR director product marketing', 'pmm'),
+    fetchJSearch('senior financial controller OR finance manager OR FP&A manager', 'finance'),
   ])
 
   // 2. Career pages
   const scraped = await scrapeAllCareerPages()
 
   // 3. Deduplicate by URL within this batch
-  const allJobs = [...pmmAdzuna, ...financeAdzuna, ...scraped]
+  const allJobs = [...pmmAdzuna, ...financeAdzuna, ...pmmJSearch, ...financeJSearch, ...scraped]
   const batchSeen = new Set()
   const unique = allJobs.filter(job => {
     if (!job.url || batchSeen.has(job.url)) return false
