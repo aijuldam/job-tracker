@@ -2,16 +2,20 @@
 /**
  * scripts/fetch-jobs.js
  *
- * 1. Fetches jobs from Adzuna API (PMM + Finance queries)
- * 2. Scrapes target company career pages via Cheerio
- * 3. Deduplicates by URL against existing Supabase records
- * 4. Scores each new job via Claude API
- * 5. Upserts to Supabase
+ * 1. Fetches jobs from Adzuna API (PMM + Finance queries, Amsterdam + NL remote)
+ * 2. Fetches from JSearch/RapidAPI (LinkedIn + Indeed + Glassdoor)
+ * 3. Fetches from Greenhouse JSON API (20+ EU tech companies)
+ * 4. Fetches from Lever JSON API (additional EU tech companies)
+ * 5. Deduplicates + location-filters (Amsterdam / Netherlands / EU remote only)
+ * 6. Scores each new job via Claude API
+ * 7. Upserts to Supabase
  *
  * Required env vars:
  *   SUPABASE_URL, SUPABASE_ANON_KEY
  *   ADZUNA_APP_ID, ADZUNA_API_KEY
  *   ANTHROPIC_API_KEY
+ * Optional:
+ *   RAPIDAPI_KEY  (JSearch — LinkedIn/Indeed/Glassdoor)
  */
 
 import Anthropic from '@anthropic-ai/sdk'
@@ -56,7 +60,15 @@ Based in Amsterdam. Targeting Senior Controller, Finance Manager, Controlling Ma
 
 // ── Keyword lists ─────────────────────────────────────────────────────────────
 
-const PMM_KEYWORDS = ['product marketing', 'pmm', 'product marketer']
+const PMM_KEYWORDS = [
+  'product marketing',
+  'pmm',
+  'product marketer',
+  'head of marketing',
+  'vp marketing',
+  'director of marketing',
+]
+
 const FINANCE_KEYWORDS = [
   'controller',
   'finance manager',
@@ -69,34 +81,66 @@ const FINANCE_KEYWORDS = [
   'finance director',
   'senior finance',
   'finance business partner',
+  'vp finance',
+  'chief financial',
 ]
+
+// ── Location filter ───────────────────────────────────────────────────────────
+// Keep only Amsterdam/NL jobs or EU-remote jobs; drop US/UK-only remote
+
+function isRelevantLocation(location) {
+  if (!location) return true // unknown → keep
+  const l = location.toLowerCase()
+
+  // Amsterdam or Netherlands
+  if (l.includes('amsterdam') || l.includes('netherlands') || l.includes('nederland')) return true
+
+  // Other major NL cities
+  if (l.includes('utrecht') || l.includes('rotterdam') || l.includes('eindhoven') ||
+      l.includes('den haag') || l.includes('the hague') || l.includes('haarlem')) return true
+
+  // EU remote — keep unless it explicitly says US/UK/Canada-only
+  if (l.includes('remote')) {
+    const nonEuOnly = [
+      'united states', 'usa', 'us only', 'us-only',
+      'united kingdom', 'uk only', 'uk-only',
+      'canada', 'australia', 'latin america',
+    ]
+    if (nonEuOnly.some(x => l.includes(x))) return false
+    return true
+  }
+
+  return false
+}
 
 // ── Adzuna API ────────────────────────────────────────────────────────────────
 
-async function fetchAdzuna(query, tab) {
+async function fetchAdzuna(query, tab, where = 'amsterdam') {
   if (!ADZUNA_APP_ID || !ADZUNA_API_KEY) {
     console.warn('Adzuna credentials not set — skipping')
     return []
   }
   try {
+    const params = {
+      app_id: ADZUNA_APP_ID,
+      app_key: ADZUNA_API_KEY,
+      what: query,
+      results_per_page: 50,
+      sort_by: 'date',
+    }
+    if (where) params.where = where
+
     const { data } = await axios.get('https://api.adzuna.com/v1/api/jobs/nl/search/1', {
-      params: {
-        app_id: ADZUNA_APP_ID,
-        app_key: ADZUNA_API_KEY,
-        what: query,
-        where: 'amsterdam',
-        results_per_page: 50,
-        sort_by: 'date',
-      },
+      params,
       timeout: 30_000,
     })
     const results = data.results ?? []
-    console.log(`Adzuna [${tab}]: ${results.length} results`)
+    console.log(`Adzuna [${tab}/${where || 'NL'}]: ${results.length} results`)
     return results.map(job => ({
       tab,
       title: job.title,
       company: job.company?.display_name ?? 'Unknown',
-      location: job.location?.display_name ?? 'Amsterdam',
+      location: job.location?.display_name ?? 'Netherlands',
       url: job.redirect_url,
       postedDate: job.created?.split('T')[0] ?? null,
       salaryMin: job.salary_min ? Math.round(job.salary_min) : null,
@@ -134,18 +178,25 @@ async function fetchJSearch(query, tab) {
     })
     const results = data.data ?? []
     console.log(`JSearch [${tab}]: ${results.length} results`)
-    return results.map(job => ({
-      tab,
-      title: job.job_title,
-      company: job.employer_name ?? 'Unknown',
-      location: job.job_city ? `${job.job_city}, ${job.job_country}` : 'Amsterdam',
-      url: job.job_apply_link ?? job.job_google_link,
-      postedDate: job.job_posted_at_datetime_utc?.split('T')[0] ?? null,
-      salaryMin: job.job_min_salary ? Math.round(job.job_min_salary) : null,
-      salaryMax: job.job_max_salary ? Math.round(job.job_max_salary) : null,
-      description: job.job_description?.slice(0, 600) ?? '',
-      source: 'adzuna', // reuse existing source enum value for aggregator jobs
-    }))
+    return results
+      .filter(job => {
+        const loc = job.job_city
+          ? `${job.job_city}, ${job.job_country}`
+          : (job.job_country ?? '')
+        return isRelevantLocation(loc)
+      })
+      .map(job => ({
+        tab,
+        title: job.job_title,
+        company: job.employer_name ?? 'Unknown',
+        location: job.job_city ? `${job.job_city}, ${job.job_country}` : 'Netherlands',
+        url: job.job_apply_link ?? job.job_google_link,
+        postedDate: job.job_posted_at_datetime_utc?.split('T')[0] ?? null,
+        salaryMin: job.job_min_salary ? Math.round(job.job_min_salary) : null,
+        salaryMax: job.job_max_salary ? Math.round(job.job_max_salary) : null,
+        description: job.job_description?.slice(0, 600) ?? '',
+        source: 'adzuna',
+      }))
   } catch (err) {
     console.error(`JSearch [${tab}] failed: ${err.message}`)
     return []
@@ -153,7 +204,6 @@ async function fetchJSearch(query, tab) {
 }
 
 // ── Greenhouse JSON API ───────────────────────────────────────────────────────
-// Many Dutch tech companies run Greenhouse; the JSON API is reliable and polite.
 
 async function fetchGreenhouse(boardToken, company, tab, keywords) {
   try {
@@ -164,13 +214,14 @@ async function fetchGreenhouse(boardToken, company, tab, keywords) {
     const jobs = (data.jobs ?? [])
       .filter(job => {
         const lower = job.title.toLowerCase()
-        return keywords.some(kw => lower.includes(kw))
+        const locationOk = isRelevantLocation(job.location?.name)
+        return locationOk && keywords.some(kw => lower.includes(kw))
       })
       .map(job => ({
         tab,
         title: job.title,
         company,
-        location: job.location?.name ?? 'Amsterdam',
+        location: job.location?.name ?? 'Netherlands',
         url: job.absolute_url,
         postedDate: job.updated_at?.split('T')[0] ?? null,
         salaryMin: null,
@@ -178,12 +229,155 @@ async function fetchGreenhouse(boardToken, company, tab, keywords) {
         description: job.content ? cheerioLoad(job.content).text().slice(0, 600) : '',
         source: 'career_page',
       }))
-    console.log(`Greenhouse [${company}]: ${jobs.length} matching jobs`)
+    if (jobs.length > 0) console.log(`Greenhouse [${company}]: ${jobs.length} matching jobs`)
     return jobs
   } catch (err) {
-    console.warn(`Greenhouse [${boardToken}] failed: ${err.message}`)
+    // 404 = company doesn't use this Greenhouse token — silent skip
+    if (!err.response || err.response.status !== 404) {
+      console.warn(`Greenhouse [${boardToken}] failed: ${err.message}`)
+    }
     return []
   }
+}
+
+// ── Lever JSON API ────────────────────────────────────────────────────────────
+
+async function fetchLever(company, companyName, tab, keywords) {
+  try {
+    const { data } = await axios.get(
+      `https://api.lever.co/v0/postings/${company}?mode=json`,
+      { timeout: 15_000 },
+    )
+    const jobs = (Array.isArray(data) ? data : [])
+      .filter(job => {
+        const lower = job.text?.toLowerCase() ?? ''
+        const locationOk = isRelevantLocation(job.categories?.location ?? job.country ?? '')
+        return locationOk && keywords.some(kw => lower.includes(kw))
+      })
+      .map(job => ({
+        tab,
+        title: job.text,
+        company: companyName,
+        location: job.categories?.location ?? 'Netherlands',
+        url: job.hostedUrl,
+        postedDate: job.createdAt
+          ? new Date(job.createdAt).toISOString().split('T')[0]
+          : null,
+        salaryMin: null,
+        salaryMax: null,
+        description: job.descriptionPlain?.slice(0, 600) ?? '',
+        source: 'career_page',
+      }))
+    if (jobs.length > 0) console.log(`Lever [${companyName}]: ${jobs.length} matching jobs`)
+    return jobs
+  } catch (err) {
+    if (!err.response || err.response.status !== 404) {
+      console.warn(`Lever [${company}] failed: ${err.message}`)
+    }
+    return []
+  }
+}
+
+// ── Career page targets ───────────────────────────────────────────────────────
+
+async function scrapeAllCareerPages() {
+  const results = []
+
+  // ── Greenhouse boards (Amsterdam HQ / EU remote tech companies) ──
+  const greenhouseTargets = [
+    // Amsterdam HQ
+    { token: 'adyen',         name: 'Adyen' },
+    { token: 'mollie',        name: 'Mollie' },
+    { token: 'getyourguide',  name: 'GetYourGuide' },
+    { token: 'templafy',      name: 'Templafy' },
+    { token: 'messagebird',   name: 'MessageBird' },
+    { token: 'catawiki',      name: 'Catawiki' },
+    { token: 'picnic',        name: 'Picnic' },
+    { token: 'takeaway',      name: 'Just Eat Takeaway' },
+    { token: 'coolblue',      name: 'Coolblue' },
+    { token: 'booking',       name: 'Booking.com' },
+    // EU remote-friendly tech
+    { token: 'elastic',       name: 'Elastic' },
+    { token: 'spotify',       name: 'Spotify' },
+    { token: 'klarna',        name: 'Klarna' },
+    { token: 'figma',         name: 'Figma' },
+    { token: 'miro',          name: 'Miro' },
+    { token: 'typeform',      name: 'Typeform' },
+    { token: 'personio',      name: 'Personio' },
+    { token: 'contentful',    name: 'Contentful' },
+    { token: 'n26',           name: 'N26' },
+    { token: 'wise',          name: 'Wise' },
+    { token: 'sumup',         name: 'SumUp' },
+    { token: 'deliveroo',     name: 'Deliveroo' },
+    { token: 'stripe',        name: 'Stripe' },
+    { token: 'intercom',      name: 'Intercom' },
+    { token: 'gitlab',        name: 'GitLab' },
+    { token: 'datadog',       name: 'Datadog' },
+    { token: 'mongodb',       name: 'MongoDB' },
+    { token: 'twilio',        name: 'Twilio' },
+    { token: 'semrush',       name: 'Semrush' },
+    { token: 'bynder',        name: 'Bynder' },
+  ]
+
+  // Fetch all Greenhouse boards in batches of 5 to be polite
+  for (let i = 0; i < greenhouseTargets.length; i += 5) {
+    const batch = greenhouseTargets.slice(i, i + 5)
+    await Promise.all(
+      batch.flatMap(({ token, name }) => [
+        fetchGreenhouse(token, name, 'pmm', PMM_KEYWORDS).then(r => results.push(...r)),
+        fetchGreenhouse(token, name, 'finance', FINANCE_KEYWORDS).then(r => results.push(...r)),
+      ]),
+    )
+    await sleep(500)
+  }
+
+  // ── Lever boards ──
+  const leverTargets = [
+    { company: 'wetransfer',  name: 'WeTransfer' },
+    { company: 'catawiki',    name: 'Catawiki' },
+    { company: 'messagebird', name: 'MessageBird' },
+    { company: 'otrium',      name: 'Otrium' },
+    { company: 'sendcloud',   name: 'Sendcloud' },
+    { company: 'lightyear',   name: 'Lightyear' },
+    { company: 'travix',      name: 'Travix' },
+    { company: 'fairphone',   name: 'Fairphone' },
+    { company: 'messagebird', name: 'MessageBird' },
+  ]
+
+  for (let i = 0; i < leverTargets.length; i += 5) {
+    const batch = leverTargets.slice(i, i + 5)
+    await Promise.all(
+      batch.flatMap(({ company, name }) => [
+        fetchLever(company, name, 'pmm', PMM_KEYWORDS).then(r => results.push(...r)),
+        fetchLever(company, name, 'finance', FINANCE_KEYWORDS).then(r => results.push(...r)),
+      ]),
+    )
+    await sleep(500)
+  }
+
+  // ── HTML scraping fallback for companies not on Greenhouse/Lever ──
+  const htmlTargets = [
+    { url: 'https://careers.adyen.com/vacancies', company: 'Adyen', tabs: ['pmm', 'finance'] },
+    { url: 'https://jobs.booking.com/jobs', company: 'Booking.com', tabs: ['pmm', 'finance'] },
+    { url: 'https://www.asml.com/en/careers/find-your-job', company: 'ASML', tabs: ['finance'] },
+    { url: 'https://careers.takeaway.com/global/en', company: 'Just Eat Takeaway', tabs: ['pmm', 'finance'] },
+    { url: 'https://jobs.picnic.app', company: 'Picnic', tabs: ['finance'] },
+    { url: 'https://www.ing.jobs/netherlands', company: 'ING', tabs: ['finance'] },
+    { url: 'https://careers.abn.nl/en', company: 'ABN AMRO', tabs: ['finance'] },
+    { url: 'https://www.philips.com/a-w/careers/jobs.html', company: 'Philips', tabs: ['pmm', 'finance'] },
+    { url: 'https://jobs.tomtom.com', company: 'TomTom', tabs: ['pmm', 'finance'] },
+    { url: 'https://careers.wehkamp.com', company: 'Wehkamp', tabs: ['pmm', 'finance'] },
+  ]
+
+  for (const { url, company, tabs } of htmlTargets) {
+    for (const tab of tabs) {
+      const kw = tab === 'pmm' ? PMM_KEYWORDS : FINANCE_KEYWORDS
+      results.push(...(await scrapeCareerPage(url, company, tab, kw)))
+    }
+    await sleep(800)
+  }
+
+  return results
 }
 
 // ── Generic Cheerio scraper ───────────────────────────────────────────────────
@@ -228,7 +422,7 @@ async function scrapeCareerPage(url, company, tab, keywords) {
       })
     })
 
-    console.log(`Scraped [${company}]: ${found.length} matching jobs`)
+    if (found.length > 0) console.log(`Scraped [${company}]: ${found.length} matching jobs`)
     return found
   } catch (err) {
     console.warn(`Scrape [${company}] failed: ${err.message}`)
@@ -236,83 +430,75 @@ async function scrapeCareerPage(url, company, tab, keywords) {
   }
 }
 
-// ── Career page targets ───────────────────────────────────────────────────────
+// ── Title pre-filter ─────────────────────────────────────────────────────────
+// Skip scoring entirely if the title doesn't contain a seniority signal
 
-async function scrapeAllCareerPages() {
-  const results = []
-
-  // Greenhouse API (JSON, reliable)
-  results.push(...(await fetchGreenhouse('templafy', 'Templafy', 'pmm', PMM_KEYWORDS)))
-  results.push(...(await fetchGreenhouse('templafy', 'Templafy', 'finance', FINANCE_KEYWORDS)))
-  results.push(...(await fetchGreenhouse('getyourguide', 'GetYourGuide', 'pmm', PMM_KEYWORDS)))
-  results.push(...(await fetchGreenhouse('getyourguide', 'GetYourGuide', 'finance', FINANCE_KEYWORDS)))
-  results.push(...(await fetchGreenhouse('mollie', 'Mollie', 'pmm', PMM_KEYWORDS)))
-  results.push(...(await fetchGreenhouse('mollie', 'Mollie', 'finance', FINANCE_KEYWORDS)))
-  results.push(...(await fetchGreenhouse('adyen', 'Adyen', 'pmm', PMM_KEYWORDS)))
-  results.push(...(await fetchGreenhouse('adyen', 'Adyen', 'finance', FINANCE_KEYWORDS)))
-
-  // HTML scraping for non-Greenhouse sites (some are SPAs; links still appear in SSR HTML)
-  const targets = [
-    { url: 'https://careers.adyen.com', company: 'Adyen', tabs: ['pmm', 'finance'] },
-    { url: 'https://jobs.booking.com', company: 'Booking.com', tabs: ['pmm', 'finance'] },
-    { url: 'https://www.asml.com/en/careers', company: 'ASML', tabs: ['finance'] },
-    { url: 'https://www.mollie.com/en/careers', company: 'Mollie', tabs: ['pmm', 'finance'] },
-    { url: 'https://careers.takeaway.com', company: 'Just Eat Takeaway', tabs: ['pmm', 'finance'] },
-    { url: 'https://jobs.picnic.app', company: 'Picnic', tabs: ['finance'] },
-    { url: 'https://jobs.tesla.com/en_us/filter#?filterOptions=location_Amsterdam', company: 'Tesla', tabs: ['finance'] },
-  ]
-
-  for (const { url, company, tabs } of targets) {
-    for (const tab of tabs) {
-      const kw = tab === 'pmm' ? PMM_KEYWORDS : FINANCE_KEYWORDS
-      results.push(...(await scrapeCareerPage(url, company, tab, kw)))
-    }
-    // Polite delay between sites
-    await sleep(1000)
-  }
-
-  return results
+const TITLE_KEYWORDS = {
+  pmm:     ['head of', 'director', 'senior manager', 'vp ', 'vice president'],
+  finance: ['manager', 'head of', 'controller', 'director', 'vp ', 'vice president'],
 }
 
-// ── Claude scoring ────────────────────────────────────────────────────────────
-
-async function scoreJob(job) {
-  if (!anthropic) {
-    console.warn('ANTHROPIC_API_KEY not set — using defaults')
-    return defaultScoring()
-  }
-  const profile = job.tab === 'pmm' ? PMM_PROFILE : FINANCE_PROFILE
-  const prompt = `You are evaluating job fit for a candidate with this profile:
-${profile}
-
-Job: ${job.title} at ${job.company}
-Description: ${job.description.slice(0, 600) || 'Not available'}
-
-Return JSON only:
-{
-  "match_score": 0-100,
-  "seniority_level": "Director|VP|Head of|Senior Manager",
-  "company_size": "startup|scale-up|enterprise",
-  "industry": "string",
-  "salary_estimate_min": number or null,
-  "salary_estimate_max": number or null,
-  "reasoning": "1 sentence"
-}`
-
-  try {
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 512,
-      messages: [{ role: 'user', content: prompt }],
-    })
-    const text = response.content[0].text
-    const jsonStr = text.match(/\{[\s\S]*\}/)?.[0]
-    return JSON.parse(jsonStr)
-  } catch (err) {
-    console.error(`Scoring failed for "${job.title}": ${err.message}`)
-    return defaultScoring()
-  }
+function isTitleRelevant(title, tab) {
+  const lower = title.toLowerCase()
+  return TITLE_KEYWORDS[tab]?.some(kw => lower.includes(kw)) ?? true
 }
+
+// ── Company metadata lookup ───────────────────────────────────────────────────
+// Hardcoded so we don't burn Claude tokens on well-known companies
+
+const COMPANY_LOOKUP = {
+  'netflix':        { industry: 'Streaming & Entertainment', company_size: 'enterprise' },
+  'uber':           { industry: 'Mobility & Delivery Tech',  company_size: 'enterprise' },
+  'booking.com':    { industry: 'Travel Tech',               company_size: 'enterprise' },
+  'booking':        { industry: 'Travel Tech',               company_size: 'enterprise' },
+  'adyen':          { industry: 'Fintech / Payments',        company_size: 'enterprise' },
+  'mollie':         { industry: 'Fintech / Payments',        company_size: 'scale-up'   },
+  'justeat':        { industry: 'Food Delivery Tech',        company_size: 'enterprise' },
+  'just eat':       { industry: 'Food Delivery Tech',        company_size: 'enterprise' },
+  'takeaway':       { industry: 'Food Delivery Tech',        company_size: 'enterprise' },
+  'backbase':       { industry: 'Fintech / Banking Tech',    company_size: 'scale-up'   },
+  'spotify':        { industry: 'Streaming & Entertainment', company_size: 'enterprise' },
+  'klarna':         { industry: 'Fintech / Payments',        company_size: 'enterprise' },
+  'wise':           { industry: 'Fintech / Payments',        company_size: 'scale-up'   },
+  'stripe':         { industry: 'Fintech / Payments',        company_size: 'enterprise' },
+  'figma':          { industry: 'Design & Collaboration',    company_size: 'enterprise' },
+  'miro':           { industry: 'Design & Collaboration',    company_size: 'scale-up'   },
+  'elastic':        { industry: 'Enterprise Software',       company_size: 'enterprise' },
+  'datadog':        { industry: 'DevOps & Observability',    company_size: 'enterprise' },
+  'gitlab':         { industry: 'DevOps & Developer Tools',  company_size: 'enterprise' },
+  'mongodb':        { industry: 'Database & Cloud',          company_size: 'enterprise' },
+  'contentful':     { industry: 'CMS & Content Platform',    company_size: 'scale-up'   },
+  'personio':       { industry: 'HR Tech',                   company_size: 'scale-up'   },
+  'typeform':       { industry: 'SaaS / No-code',            company_size: 'scale-up'   },
+  'getyourguide':   { industry: 'Travel Tech',               company_size: 'scale-up'   },
+  'picnic':         { industry: 'Grocery & Delivery Tech',   company_size: 'scale-up'   },
+  'catawiki':       { industry: 'E-commerce / Marketplace',  company_size: 'scale-up'   },
+  'wetransfer':     { industry: 'SaaS / File Sharing',       company_size: 'scale-up'   },
+  'bynder':         { industry: 'Digital Asset Management',  company_size: 'scale-up'   },
+  'messagebird':    { industry: 'Communications Platform',   company_size: 'scale-up'   },
+  'bird':           { industry: 'Communications Platform',   company_size: 'scale-up'   },
+  'coolblue':       { industry: 'E-commerce / Retail',       company_size: 'enterprise' },
+  'sumup':          { industry: 'Fintech / Payments',        company_size: 'scale-up'   },
+  'n26':            { industry: 'Fintech / Neobank',         company_size: 'scale-up'   },
+  'deliveroo':      { industry: 'Food Delivery Tech',        company_size: 'enterprise' },
+  'intercom':       { industry: 'Customer Engagement SaaS',  company_size: 'scale-up'   },
+  'semrush':        { industry: 'MarTech / SEO',             company_size: 'scale-up'   },
+  'twilio':         { industry: 'Communications Platform',   company_size: 'enterprise' },
+}
+
+function lookupCompany(companyName) {
+  const lower = companyName.toLowerCase()
+  for (const [key, meta] of Object.entries(COMPANY_LOOKUP)) {
+    if (lower.includes(key)) return meta
+  }
+  return null
+}
+
+// ── Batch Claude scoring (one API call per tab) ───────────────────────────────
+
+const PMM_SYSTEM = `You are scoring job fit for a senior Product Marketing leader. Background: 10+ years in product marketing and GTM. Previously at Booking.com (drove payments adoption 3K→1M properties, tripled app revenue) and Decathlon (ecommerce, loyalty, B2C apps). Expert in go-to-market strategy, product launches, and cross-functional leadership. Based in Amsterdam. Target: Director or Head-of level PMM roles.`
+
+const FINANCE_SYSTEM = `You are scoring job fit for a senior Finance professional. Background: finance leadership with strong analytical and commercial acumen. Experience in controlling, FP&A, and business partnering in tech/scale-up environments. Based in Amsterdam.`
 
 function defaultScoring() {
   return {
@@ -323,6 +509,73 @@ function defaultScoring() {
     salary_estimate_min: null,
     salary_estimate_max: null,
     reasoning: 'Default — scoring unavailable',
+  }
+}
+
+async function scoreJobsBatch(jobs) {
+  if (!anthropic) {
+    console.warn('ANTHROPIC_API_KEY not set — using defaults')
+    jobs.forEach(job => { job.scoring = defaultScoring() })
+    return
+  }
+
+  // Group by tab
+  const byTab = { pmm: [], finance: [] }
+  jobs.forEach((job, idx) => byTab[job.tab]?.push({ job, idx }))
+
+  for (const [tab, entries] of Object.entries(byTab)) {
+    if (entries.length === 0) continue
+
+    const system = tab === 'pmm' ? PMM_SYSTEM : FINANCE_SYSTEM
+    const jobLines = entries
+      .map(({ job }, i) => {
+        const snippet = (job.description || '').slice(0, 150).replace(/\s+$/, '')
+        return `${i + 1}. "${job.title}" at ${job.company} — ${snippet || 'No description'}`
+      })
+      .join('\n')
+
+    const userMsg = `Score each job. Return ONLY a JSON array, no markdown, no explanation.
+
+Jobs:
+${jobLines}
+
+Return: [{"index":1,"match_score":0-100,"seniority_level":"Director|Head of|Senior Manager|Manager|Controller","salary_estimate_min":number_or_null,"salary_estimate_max":number_or_null,"reasoning":"1 sentence"}]`
+
+    try {
+      const response = await anthropic.messages.create({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 1024,
+        system,
+        messages: [{ role: 'user', content: userMsg }],
+      })
+      const text = response.content[0].text
+      const jsonStr = text.match(/\[[\s\S]*\]/)?.[0]
+      const results = JSON.parse(jsonStr)
+
+      results.forEach(result => {
+        const entry = entries[result.index - 1]
+        if (!entry) return
+        const companyMeta = lookupCompany(entry.job.company)
+        entry.job.scoring = {
+          match_score: result.match_score,
+          seniority_level: result.seniority_level,
+          salary_estimate_min: result.salary_estimate_min ?? null,
+          salary_estimate_max: result.salary_estimate_max ?? null,
+          reasoning: result.reasoning ?? '',
+          industry: companyMeta?.industry ?? 'Technology',
+          company_size: companyMeta?.company_size ?? 'scale-up',
+        }
+        console.log(`  scored "${entry.job.title}" @ ${entry.job.company} → ${result.match_score}/100`)
+      })
+
+      // Fallback for any jobs not returned in response
+      entries.forEach(({ job }) => {
+        if (!job.scoring) job.scoring = defaultScoring()
+      })
+    } catch (err) {
+      console.error(`Batch scoring [${tab}] failed: ${err.message}`)
+      entries.forEach(({ job }) => { job.scoring = defaultScoring() })
+    }
   }
 }
 
@@ -346,7 +599,6 @@ async function upsertJobs(jobs) {
     location: job.location,
     url: job.url,
     posted_date: job.postedDate,
-    // If Adzuna provided a salary use it (not estimated); otherwise fall back to Claude's estimate
     salary_min: job.salaryMin ?? job.scoring?.salary_estimate_min ?? null,
     salary_max: job.salaryMax ?? job.scoring?.salary_estimate_max ?? null,
     salary_is_estimated: job.salaryMin == null && job.salaryMax == null,
@@ -381,53 +633,63 @@ function sleep(ms) {
 async function main() {
   console.log('=== fetch-jobs start', new Date().toISOString(), '===')
 
-  // 1. Adzuna + JSearch in parallel
-  const [pmmAdzuna, financeAdzuna, pmmJSearch, financeJSearch] = await Promise.all([
-    fetchAdzuna('product marketing director OR head of product marketing', 'pmm'),
-    fetchAdzuna('finance manager OR financial controller OR head of finance OR FP&A', 'finance'),
+  // 1. Adzuna (Amsterdam) + Adzuna (NL-wide remote) + JSearch — all in parallel
+  const [
+    pmmAdzunaAms, financeAdzunaAms,
+    pmmAdzunaNL, financeAdzunaNL,
+    pmmJSearch, financeJSearch,
+  ] = await Promise.all([
+    fetchAdzuna('product marketing manager OR head of product marketing OR director product marketing', 'pmm', 'amsterdam'),
+    fetchAdzuna('finance manager OR financial controller OR head of finance OR FP&A', 'finance', 'amsterdam'),
+    fetchAdzuna('product marketing manager OR head of product marketing', 'pmm', null),
+    fetchAdzuna('finance manager OR financial controller OR head of finance', 'finance', null),
     fetchJSearch('head of product marketing OR VP product marketing OR director product marketing', 'pmm'),
     fetchJSearch('senior financial controller OR finance manager OR FP&A manager', 'finance'),
   ])
 
-  // 2. Career pages
+  // 2. Career pages (Greenhouse + Lever + HTML scraping)
   const scraped = await scrapeAllCareerPages()
 
-  // 3. Deduplicate by URL within this batch
-  const allJobs = [...pmmAdzuna, ...financeAdzuna, ...pmmJSearch, ...financeJSearch, ...scraped]
+  // 3. Merge + location-filter + deduplicate by URL
+  const allJobs = [
+    ...pmmAdzunaAms, ...financeAdzunaAms,
+    ...pmmAdzunaNL, ...financeAdzunaNL,
+    ...pmmJSearch, ...financeJSearch,
+    ...scraped,
+  ].filter(job => isRelevantLocation(job.location))
+
   const batchSeen = new Set()
   const unique = allJobs.filter(job => {
     if (!job.url || batchSeen.has(job.url)) return false
     batchSeen.add(job.url)
     return true
   })
-  console.log(`Total unique jobs in batch: ${unique.length}`)
+  console.log(`Total unique relevant jobs in batch: ${unique.length}`)
 
-  // 4. Skip URLs already in Supabase
+  // 4. Skip URLs already in Supabase (dedup BEFORE scoring)
   const existingUrls = await getExistingUrls()
   const newJobs = unique.filter(job => !existingUrls.has(job.url))
-  console.log(`New jobs to score and insert: ${newJobs.length}`)
+  console.log(`New jobs after dedup: ${newJobs.length}`)
 
   if (newJobs.length === 0) {
     console.log('Nothing new — done.')
     return
   }
 
-  // 5. Score via Claude (5 at a time to stay within rate limits)
-  const CONCURRENCY = 5
-  for (let i = 0; i < newJobs.length; i += CONCURRENCY) {
-    const batch = newJobs.slice(i, i + CONCURRENCY)
-    await Promise.all(
-      batch.map(async job => {
-        job.scoring = await scoreJob(job)
-        console.log(
-          `  scored "${job.title}" @ ${job.company} → ${job.scoring.match_score}/100`,
-        )
-      }),
-    )
-    if (i + CONCURRENCY < newJobs.length) await sleep(2000)
-  }
+  // 5. Title pre-filter — drop jobs that don't match seniority keywords
+  const scoringCandidates = newJobs.filter(job => isTitleRelevant(job.title, job.tab))
+  const skipped = newJobs.length - scoringCandidates.length
+  if (skipped > 0) console.log(`Title filter: skipped ${skipped} junior/irrelevant titles`)
 
-  // 6. Upsert
+  // Assign default scoring to filtered-out jobs so they still get upserted (low score)
+  newJobs
+    .filter(job => !isTitleRelevant(job.title, job.tab))
+    .forEach(job => { job.scoring = { ...defaultScoring(), match_score: 20 } })
+
+  // 6. Batch score via Claude Haiku — one API call per tab
+  await scoreJobsBatch(scoringCandidates)
+
+  // 7. Upsert all (scored + default-scored)
   await upsertJobs(newJobs)
 
   console.log('=== fetch-jobs done', new Date().toISOString(), '===')
