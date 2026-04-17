@@ -32,3 +32,13 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
         run: node scripts/fetch-jobs.js
+
+      - name: Send daily summary email
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          DIGEST_EMAIL: ${{ secrets.DIGEST_EMAIL }}
+          FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
+          APP_URL: ${{ secrets.APP_URL }}
+        run: node scripts/send-daily-summary.js
