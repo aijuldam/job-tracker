@@ -46,6 +46,46 @@ function isUSHQ(company: string): boolean {
   return words.some(w => US_HQ_WORDS.has(w))
 }
 
+// ── Hard filters (deterministic scan-ingest rules) ───────────────────────────
+
+type FilterCode =
+  | 'EXPIRED_7D' | 'SALARY_OVER_CAP' | 'PMM_NOT_LEADERSHIP'
+  | 'FINANCE_FPANDA' | 'FINANCE_NOT_ACCOUNTING_CTRL' | 'OUTSIDE_GEO'
+
+const SALARY_CAP: Record<Tab, number> = { 'product-marketing': 120_000, finance: 95_000 }
+
+const PMM_LEADERSHIP_KW = ['head of', 'director', 'vp ', 'vice president', 'cmo', 'chief marketing', 'principal', 'staff product marketing', 'product marketing lead']
+const PMM_EXCEPTION_COS = new Set(['booking.com', 'uber'])
+
+function passesPmmSeniority(job: Job): boolean {
+  const t = job.title.toLowerCase()
+  if (PMM_LEADERSHIP_KW.some(kw => t.includes(kw))) return true
+  if (PMM_EXCEPTION_COS.has(job.company.toLowerCase()) && t.includes('senior')) return true
+  return false
+}
+
+const FINANCE_OK_KW = ['controller', 'controlling', 'accounting', 'accountant', 'finance manager', 'accounting manager']
+const FINANCE_EXCL_KW = ["fp&a", 'financial planning', 'strategic finance', 'financial planning and analysis']
+
+function passesFinanceScope(job: Job): boolean {
+  const haystack = (job.title + ' ' + (job.reasoning ?? '')).toLowerCase()
+  if (FINANCE_EXCL_KW.some(kw => haystack.includes(kw))) return false   // FINANCE_FPANDA
+  return FINANCE_OK_KW.some(kw => job.title.toLowerCase().includes(kw))  // FINANCE_NOT_ACCOUNTING_CTRL
+}
+
+function hardFilterCode(job: Job, tab: Tab): FilterCode | null {
+  if (job.daysPosted > 7) return 'EXPIRED_7D'
+  const cap = SALARY_CAP[tab]
+  if (job.salaryMax && !job.salaryIsEstimated && job.salaryMax > cap) return 'SALARY_OVER_CAP'
+  if (tab === 'product-marketing' && !passesPmmSeniority(job)) return 'PMM_NOT_LEADERSHIP'
+  if (tab === 'finance' && !passesFinanceScope(job)) return 'FINANCE_FPANDA'
+  return null
+}
+
+function applyHardFilters(jobs: Job[], tab: Tab): Job[] {
+  return jobs.filter(job => hardFilterCode(job, tab) === null)
+}
+
 // ── DB row → Job ──────────────────────────────────────────────────────────────
 
 const SENIORITY_MAP: Record<string, Seniority> = {
@@ -180,8 +220,8 @@ export default function App() {
   }, [])
 
   const filteredJobs = useMemo(
-    () => filterJobs(jobs, filters, getStatus),
-    [jobs, filters, getStatus],
+    () => filterJobs(applyHardFilters(jobs, activeTab), filters, getStatus),
+    [jobs, filters, getStatus, activeTab],
   )
 
   const displayJobs = useMemo(
